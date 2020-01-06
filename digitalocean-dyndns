@@ -7,6 +7,7 @@ Digital Ocean DynDNS
 Dynamic DNS updater for Digital Ocean API v2
 
 Copyright (c) 2014 Frédéric Massart - FMCorz.net
+Copyright (c) 2020 Sebastian Wallat - Ruhr-University Bochum, Germany
 
 Licensed under The MIT License
 Redistributions of files must retain the above copyright notice.
@@ -18,9 +19,9 @@ import sys
 import requests
 import argparse
 import logging
-import json
+import os
 
-TOKEN = 'X'
+DIGITALOCEAN_TOKEN = os.environ("DIGITALOCEAN_TOKEN")
 API = 'https://api.digitalocean.com/v2'
 
 # Error codes
@@ -30,11 +31,19 @@ REQUEST_ERROR = 4
 IP_FETCH_FAILED = 8
 
 
-def getIp():
+def get_ip4():
     """Return the external IPv4"""
     r = requests.get('https://api.ipify.org')
     if r.status_code != 200:
-        logging.error('Could not obtain IP from external resource')
+        logging.error('Could not obtain IPv4 from external resource')
+        sys.exit(IP_FETCH_FAILED)
+    return r.text
+
+def get_ip6():
+    """Return the external IPv4"""
+    r = requests.get('https://api6.ipify.org')
+    if r.status_code != 200:
+        logging.error('Could not obtain IPv6 from external resource')
         sys.exit(IP_FETCH_FAILED)
     return r.text
 
@@ -43,10 +52,10 @@ def request(uri, params={}, method='GET'):
     url = API + '/' + uri.strip('/')
 
     headers = {
-        'Authorization': 'Bearer {0}'.format(TOKEN)
+        'Authorization': 'Bearer {0}'.format(DIGITALOCEAN_TOKEN)
     }
 
-    logging.debug('Requesting: %s (%s)' % (url, method))
+    logging.debug('Requesting: {} ({})'.format(url, method))
     if method == 'POST':
         r = requests.post(url, headers=headers, data=params)
     elif method == 'PUT':
@@ -55,15 +64,15 @@ def request(uri, params={}, method='GET'):
         r = requests.get(url, params=params, headers=headers)
 
     if r.status_code < 200 or r.status_code >= 300:
-        logging.error(u'Host replied with a non-OK status. Error: %s' % r.status_code)
+        logging.error(u'Host replied with a non-OK status. Error: {}'.format(r.status_code))
         sys.exit(REQUEST_ERROR)
 
     return r.json()
 
 # Define arguments
 parser = argparse.ArgumentParser(description='Dynamic DNS updater for Digital Ocean')
-parser.add_argument('--domain', '-d', help='Domain name', required=True)
-parser.add_argument('--record', '-r', help='Record for domain', required=True)
+parser.add_argument('--domain', '-d', help='Base Domain name', required=True)
+parser.add_argument('--record', '-r', help='Record for domain, e.g. @, *, or subdomain', required=True)
 parser.add_argument('--allownew', '-c', help='Allow creation of a new record', action='store_true')
 parser.add_argument('--verbose', '-v', help='Increase verbosity', action='count', default=0)
 args = parser.parse_args()
@@ -79,40 +88,51 @@ else:
 logging.basicConfig(format='%(message)s', level=debug)
 
 # Looking up the records
-recordId = None
+recordIds = {'A': None, 'AAAA': None}
 records = request('/domains/{0}/records'.format(args.domain))
 for record in records.get('domain_records'):
-    if record.get('type') == 'A' and record.get('name') == args.record:
-        recordId = record.get('id')
-        logging.info('Found record %s, ID: %s' % (args.record, recordId))
-        break
+    if record.get('type') in recordIds.keys() and record.get('name') == args.record:
+        recordIds[record.get('type')] = record.get('id')
+        logging.info('Found record {}, ID: {}'.format(args.record, recordIds[record.get('type')]))
+        print(record)
 
 # Create the record if it does not exist
-if not recordId:
-    if not args.allownew:
-        logging.warning('Could not find the A record %s for domain %s' % (args.record, args.domain))
-        sys.exit(RECORD_NOT_FOUND)
-
-    ip = getIp()
-    params = {
-        'type': 'A',
-        'name': args.record,
-        'data': ip
-    }
-    result = request('/domains/{0}/records'.format(args.domain), params=params, method='POST')
-    logging.info('Record created with ID %s using IP %s' % (result.get('domain_record', {}).get('id', '<?>'), ip))
-
-# Update the existing record
-else:
-    ip = getIp()
-    if record.get('data') == ip:
-        logging.info('No update required')
-
+for type, id in recordIds.items():
+    if type == "A":
+        ip = get_ip4()
+        if "." not in ip:
+            logging.warning("Found no public IPv4, skipping update IPv4 entry")
+            continue
     else:
+        ip = get_ip6()
+        if ":" not in ip:
+            logging.warning("Found no public IPv6, skipping update IPv6 entry")
+            continue
+
+    if not id:
+        if not args.allownew:
+            logging.warning('Could not find the A record {} for domain {}'.format(args.record, args.domain))
+            sys.exit(RECORD_NOT_FOUND)
+
         params = {
-            'type': 'A',
+            'type': type,
             'name': args.record,
             'data': ip
         }
-        result = request('/domains/{0}/records/{1}'.format(args.domain, recordId), params=params, method="PUT")
-        logging.info('Updated record with IP %s' % (ip))
+        result = request('/domains/{0}/records'.format(args.domain), params=params, method='POST')
+        logging.info('Record created with ID {} using IP {}'.format(result.get('domain_record', {}).get('id', '<?>'), ip))
+
+    # Update the existing record
+    else:
+        if record.get('data') == ip:
+            logging.info('No update required')
+
+        else:
+            params = {
+                'type': type,
+                'name': args.record,
+                'data': ip
+            }
+            result = request('/domains/{0}/records/{1}'.format(args.domain, id), params=params, method="PUT")
+            logging.info('Updated record with IP {}'.format(ip))
+
